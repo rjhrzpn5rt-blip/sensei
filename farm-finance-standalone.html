@@ -1,0 +1,1555 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Ферма Финансы" />
+<meta name="theme-color" content="#3E2417" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>Ферма Финансы</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    overscroll-behavior: none;
+    -webkit-tap-highlight-color: transparent;
+    background: #3E2417;
+  }
+  #root { min-height: 100dvh; }
+</style>
+<!-- Telegram Mini Apps SDK — harmless no-op outside Telegram, activates
+     CloudStorage + native chrome (ready/expand/theme) when opened inside
+     a Telegram bot's Mini App button -->
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+
+// ---------- Persistence ----------
+// Works three ways depending on where this runs, auto-detected:
+// - Inside a Claude.ai artifact: uses the built-in window.storage API.
+// - Inside Telegram (as a Mini App): uses Telegram's CloudStorage, which
+//   is tied to the user's Telegram account rather than the device.
+// - Opened directly as a webpage (Safari, "Add to Home Screen"): falls
+//   back to the browser's own localStorage.
+// Note: keys can only contain A-Z a-z 0-9 _ - (Telegram's rule), so the
+// prefix uses an underscore rather than a colon.
+const STORAGE_PREFIX = "farm_finance_";
+const TG_CHUNK_SIZE = 3500; // safety margin under Telegram's 4096-char value limit
+
+function isTelegram() {
+  return !!(
+    typeof window !== "undefined" &&
+    window.Telegram &&
+    window.Telegram.WebApp &&
+    window.Telegram.WebApp.initData
+  );
+}
+
+// Reads a value that may have been split across multiple CloudStorage keys.
+function tgCloudGet(key) {
+  return new Promise((resolve) => {
+    const cs = window.Telegram.WebApp.CloudStorage;
+    cs.getItem(key + "__count", (err, countStr) => {
+      if (err || !countStr) {
+        cs.getItem(key, (err2, value) => resolve(err2 ? null : value || null));
+        return;
+      }
+      const count = parseInt(countStr, 10) || 0;
+      const keys = Array.from({ length: count }, (_, i) => `${key}__${i}`);
+      cs.getItems(keys, (err3, result) => {
+        if (err3 || !result) {
+          resolve(null);
+          return;
+        }
+        resolve(keys.map((k) => result[k] || "").join(""));
+      });
+    });
+  });
+}
+
+// Writes a value, splitting it into 3500-char chunks if it's too big for a
+// single CloudStorage key.
+function tgCloudSet(key, value) {
+  return new Promise((resolve) => {
+    const cs = window.Telegram.WebApp.CloudStorage;
+    if (value.length <= TG_CHUNK_SIZE) {
+      cs.setItem(key, value, () => {
+        cs.removeItem(key + "__count", () => resolve());
+      });
+      return;
+    }
+    const chunks = [];
+    for (let i = 0; i < value.length; i += TG_CHUNK_SIZE) chunks.push(value.slice(i, i + TG_CHUNK_SIZE));
+    let remaining = chunks.length;
+    cs.setItem(key + "__count", String(chunks.length), () => {
+      chunks.forEach((chunk, i) => {
+        cs.setItem(`${key}__${i}`, chunk, () => {
+          remaining -= 1;
+          if (remaining === 0) resolve();
+        });
+      });
+    });
+  });
+}
+
+const storage = {
+  async get(key) {
+    if (typeof window !== "undefined" && window.storage) {
+      try {
+        const r = await window.storage.get(STORAGE_PREFIX + key, false);
+        return r ? r.value : null;
+      } catch {
+        return null;
+      }
+    }
+    if (isTelegram()) {
+      try {
+        return await tgCloudGet(STORAGE_PREFIX + key);
+      } catch {
+        return null;
+      }
+    }
+    try {
+      return window.localStorage.getItem(STORAGE_PREFIX + key);
+    } catch {
+      return null;
+    }
+  },
+  async set(key, value) {
+    if (typeof window !== "undefined" && window.storage) {
+      try {
+        await window.storage.set(STORAGE_PREFIX + key, value, false);
+        return;
+      } catch {
+        /* ignore — worst case this save is skipped */
+      }
+    }
+    if (isTelegram()) {
+      try {
+        await tgCloudSet(STORAGE_PREFIX + key, value);
+        return;
+      } catch {
+        /* ignore — worst case this save is skipped */
+      }
+    }
+    try {
+      window.localStorage.setItem(STORAGE_PREFIX + key, value);
+    } catch {
+      /* storage unavailable (private browsing, etc.) — ignore */
+    }
+  },
+};
+
+// ---------- Design themes ----------
+// Two complete visual variants. Every screen reads colors from the
+// currently active theme object (T) instead of a fixed palette.
+const THEMES = {
+  pixel: {
+    mode: "pixel",
+    parchment: "#F6E7C1",
+    parchmentDark: "#E3C989",
+    parchmentDeep: "#D0AF6E",
+    wood: "#7A4A2B",
+    woodDark: "#3E2417",
+    woodDarker: "#2A1810",
+    grass: "#6ABE30",
+    grassDark: "#3E7A1C",
+    rust: "#B8452F",
+    rustDark: "#7C2C1B",
+    gold: "#F2C14E",
+    goldDark: "#B5841E",
+    sky: "#8FCFE0",
+    ink: "#2B1D0E",
+    brass: "#C9A227",
+    brassDark: "#8C6D1F",
+    screenBg: "#111C13",
+    screenGlow: true,
+  },
+  retro: {
+    // an early-90s electronic till: cream plastic body, black LCD window,
+    // orange number keys, teal function keys — no glow, boxier corners.
+    mode: "retro",
+    parchment: "#EDE7D5",
+    parchmentDark: "#D8D0B8",
+    parchmentDeep: "#C2B99E",
+    wood: "#8B8478",
+    woodDark: "#332F29",
+    woodDarker: "#1A1815",
+    grass: "#3FA34D",
+    grassDark: "#2C7A38",
+    rust: "#C0392B",
+    rustDark: "#8E2A20",
+    gold: "#E8A33D",
+    goldDark: "#B97D22",
+    sky: "#4FA89B",
+    ink: "#221F1A",
+    brass: "#9A9284",
+    brassDark: "#5C574C",
+    screenBg: "#050505",
+    screenGlow: false,
+  },
+};
+
+const FONT_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap');
+* { box-sizing: border-box; }
+html, body { overscroll-behavior: none; }
+.pf-display { font-family: 'Press Start 2P', monospace; }
+.pf-body { font-family: 'VT323', monospace; }
+button {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: manipulation;
+  font-family: inherit;
+}
+`;
+
+// ---------- Panel/button helpers (theme-aware) ----------
+// Pixel theme: hard edges, stepped bevel. Retro theme: rounder plastic
+// keys/panels with a softer glossy bevel — same call sites, different look.
+const pixelPanel = (T, bg, border, thick = 4) =>
+  T.mode === "retro"
+    ? {
+        background: bg,
+        border: `${Math.max(2, thick - 1)}px solid ${border}`,
+        borderRadius: 10,
+        boxShadow: "inset 0 2px 0 rgba(255,255,255,0.35), inset 0 -2px 0 rgba(0,0,0,0.2), 0 2px 3px rgba(0,0,0,0.3)",
+      }
+    : {
+        background: bg,
+        border: `${thick}px solid ${border}`,
+        boxShadow: `
+    inset 2px 2px 0 rgba(255,255,255,0.35),
+    inset -2px -2px 0 rgba(0,0,0,0.25),
+    4px 4px 0 rgba(0,0,0,0.35)
+  `,
+        borderRadius: 0,
+        imageRendering: "pixelated",
+      };
+
+const pixelButton = (T, bg, pressed) =>
+  T.mode === "retro"
+    ? {
+        background: bg,
+        border: `2px solid ${T.woodDark}`,
+        borderRadius: 7,
+        boxShadow: pressed
+          ? "inset 0 2px 2px rgba(0,0,0,0.35)"
+          : "inset 0 2px 0 rgba(255,255,255,0.55), inset 0 -3px 0 rgba(0,0,0,0.2), 0 2px 2px rgba(0,0,0,0.3)",
+        transform: pressed ? "translateY(1px)" : "translateY(0)",
+        transition: "transform 60ms, box-shadow 60ms",
+        cursor: "pointer",
+        touchAction: "manipulation",
+        WebkitTapHighlightColor: "transparent",
+        minHeight: 44,
+      }
+    : {
+        background: bg,
+        border: `3px solid ${T.woodDark}`,
+        boxShadow: pressed
+          ? "inset 2px 2px 0 rgba(0,0,0,0.35)"
+          : "inset 2px 2px 0 rgba(255,255,255,0.4), inset -2px -2px 0 rgba(0,0,0,0.25), 3px 3px 0 rgba(0,0,0,0.35)",
+        borderRadius: 0,
+        transform: pressed ? "translate(2px,2px)" : "translate(0,0)",
+        transition: "transform 60ms, box-shadow 60ms",
+        cursor: "pointer",
+        touchAction: "manipulation",
+        WebkitTapHighlightColor: "transparent",
+        minHeight: 44,
+      };
+
+// ---------- Categories ----------
+const DEFAULT_INCOME_CATS = [
+  { id: "salary", label: "Зарплата", icon: "💰" },
+  { id: "bonus", label: "Премия", icon: "🎁" },
+  { id: "other", label: "Иной доход", icon: "🧺" },
+];
+const DEFAULT_EXPENSE_CATS = [
+  { id: "market", label: "Супермаркет", icon: "🛒" },
+  { id: "cafe", label: "Кафе, рестораны", icon: "🍽️" },
+  { id: "taxi", label: "Такси", icon: "🚕" },
+  { id: "tax", label: "Госплатежи и налоги", icon: "🏛️" },
+  { id: "transport", label: "Транспорт", icon: "🚌" },
+  { id: "fun", label: "Развлечения", icon: "🎡" },
+  { id: "utilities", label: "ЖКХ", icon: "🏠" },
+  { id: "mobile", label: "Связь", icon: "📱" },
+  { id: "internet", label: "Интернет", icon: "🌐" },
+  { id: "pharmacy", label: "Аптеки", icon: "💊" },
+  { id: "sport", label: "Спорт", icon: "🏋️" },
+  { id: "subs", label: "Подписки", icon: "🔁" },
+  { id: "transfers", label: "Переводы", icon: "💸" },
+];
+// Looks up a category by id among the user's current income + expense lists
+// (built-in ones plus any custom categories they've added).
+function catInfo(id, incomeCats, expenseCats) {
+  return incomeCats.find((c) => c.id === id) || expenseCats.find((c) => c.id === id) || { label: id, icon: "❔" };
+}
+
+// ---------- Payment methods (cash + user-named cards) ----------
+const CASH_ACCOUNT = { id: "cash", name: "Наличные", icon: "💵" };
+const DEFAULT_CARDS = []; // starts empty — user adds their own cards
+// Looks up a card by id among the user's current cards, or falls back to
+// cash / a generic label if the card was later renamed away or removed.
+function accountInfo(id, cards) {
+  if (id === "cash") return CASH_ACCOUNT;
+  return cards.find((c) => c.id === id) || { id, name: "Удалённая карта", icon: "❔" };
+}
+
+// ---------- Currencies ----------
+const CURRENCIES = [
+  { id: "RUB", symbol: "₽", label: "Рубли" },
+  { id: "USD", symbol: "$", label: "Доллары" },
+  { id: "EUR", symbol: "€", label: "Евро" },
+  { id: "AED", symbol: "AED", label: "Дирхамы" },
+];
+const CUR_META = Object.fromEntries(CURRENCIES.map((c) => [c.id, c]));
+
+// Deterministic "historical" RUB-per-unit rate for a given day (so every
+// entry keeps the rate of the day it was recorded, like a real converter).
+function rateForDay(currency, dateMs) {
+  if (currency === "RUB") return 1;
+  const dayIndex = Math.floor(dateMs / 86400000);
+  const params = {
+    USD: { base: 91, amp: 3, speed: 0.9, seed: 0.3 },
+    EUR: { base: 99, amp: 3.2, speed: 0.7, seed: 1.7 },
+    AED: { base: 24.6, amp: 0.5, speed: 1.3, seed: 2.9 },
+  }[currency];
+  return +(params.base + params.amp * Math.sin(dayIndex * params.speed + params.seed)).toFixed(4);
+}
+
+// Recalculates a transaction's amount into another currency using the
+// exchange rate of the day the entry was made.
+function convertAmount(tx, targetCurrency) {
+  const rub = tx.amount * rateForDay(tx.currency, tx.date);
+  return rub / rateForDay(targetCurrency, tx.date);
+}
+
+// Converts an already-aggregated value (e.g. a balance) from one currency
+// into another using today's rate — used to show one figure in several
+// currencies side by side.
+function convertToday(value, fromCurrency, toCurrency) {
+  const now = Date.now();
+  const rub = value * rateForDay(fromCurrency, now);
+  return rub / rateForDay(toCurrency, now);
+}
+
+function formatMoney(value, currency) {
+  const meta = CUR_META[currency];
+  const decimals = currency === "RUB" ? 0 : 2;
+  const num = value.toLocaleString("ru-RU", { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+  return currency === "USD" || currency === "EUR" ? `${meta.symbol}${num}` : `${num} ${meta.symbol}`;
+}
+
+// Palette used for pie-diagram slices — warm, earthy, but distinct enough
+// to tell 12+ categories apart at a glance.
+const PIE_PALETTE = [
+  "#6ABE30", "#B8452F", "#F2C14E", "#8FCFE0", "#7A4A2B", "#D0AF6E",
+  "#3E7A1C", "#7C2C1B", "#B5841E", "#4A7C8C", "#A66A3C", "#5C7A3E",
+  "#C97B4A", "#8A5FA0",
+];
+
+// ---------- Date helpers (all tied to the phone's real current date/time) ----------
+const DAY_MS = 86400000;
+function startOfDay(ts) {
+  const d = new Date(ts);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+function fmtDay(ts) {
+  return new Date(ts).toLocaleDateString("ru-RU", { day: "numeric", month: "short" });
+}
+function fmtWeekday(ts) {
+  const s = new Date(ts).toLocaleDateString("ru-RU", { weekday: "short" }).replace(".", "");
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function App() {
+  const [screen, setScreen] = useState("calc"); // calc | chart
+  const [themeName, setThemeName] = useState("pixel"); // pixel | retro
+  const T = THEMES[themeName];
+  const [transactions, setTransactions] = useState([]); // starts empty — no mock data
+  const [cards, setCards] = useState(DEFAULT_CARDS); // user-named cards; cash is always available separately
+  const [incomeCats, setIncomeCats] = useState(DEFAULT_INCOME_CATS);
+  const [expenseCats, setExpenseCats] = useState(DEFAULT_EXPENSE_CATS);
+  const [step, setStep] = useState("amount"); // amount | category | method
+  const [amount, setAmount] = useState("");
+  const [type, setType] = useState("income");
+  const [currency, setCurrency] = useState("RUB"); // used both for entry and for display everywhere
+  const [pendingCategory, setPendingCategory] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [pressed, setPressed] = useState(null);
+  const [loaded, setLoaded] = useState(false); // true once the saved data has been read back in
+
+  const cats = type === "income" ? incomeCats : expenseCats;
+
+  // load everything saved from a previous visit, once, on first mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [txRaw, cardsRaw, incRaw, expRaw, themeRaw, currRaw] = await Promise.all([
+        storage.get("transactions"),
+        storage.get("cards"),
+        storage.get("incomeCats"),
+        storage.get("expenseCats"),
+        storage.get("theme"),
+        storage.get("currency"),
+      ]);
+      if (cancelled) return;
+      try {
+        if (txRaw) setTransactions(JSON.parse(txRaw));
+      } catch {}
+      try {
+        if (cardsRaw) setCards(JSON.parse(cardsRaw));
+      } catch {}
+      try {
+        if (incRaw) setIncomeCats(JSON.parse(incRaw));
+      } catch {}
+      try {
+        if (expRaw) setExpenseCats(JSON.parse(expRaw));
+      } catch {}
+      if (themeRaw) setThemeName(themeRaw);
+      if (currRaw) setCurrency(currRaw);
+      setLoaded(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // save back to storage whenever any of this changes — but only after the
+  // initial load has finished, so we never overwrite saved data with the
+  // empty defaults during that first render
+  useEffect(() => {
+    if (loaded) storage.set("transactions", JSON.stringify(transactions));
+  }, [transactions, loaded]);
+  useEffect(() => {
+    if (loaded) storage.set("cards", JSON.stringify(cards));
+  }, [cards, loaded]);
+  useEffect(() => {
+    if (loaded) storage.set("incomeCats", JSON.stringify(incomeCats));
+  }, [incomeCats, loaded]);
+  useEffect(() => {
+    if (loaded) storage.set("expenseCats", JSON.stringify(expenseCats));
+  }, [expenseCats, loaded]);
+  useEffect(() => {
+    if (loaded) storage.set("theme", themeName);
+  }, [themeName, loaded]);
+  useEffect(() => {
+    if (loaded) storage.set("currency", currency);
+  }, [currency, loaded]);
+
+  // if running inside Telegram as a Mini App, tell it we're ready, expand
+  // to full height, and match its chrome to the current theme
+  useEffect(() => {
+    if (!loaded) return;
+    if (typeof window !== "undefined" && window.Telegram && window.Telegram.WebApp) {
+      const tg = window.Telegram.WebApp;
+      try {
+        tg.ready();
+        tg.expand();
+        if (tg.setHeaderColor) tg.setHeaderColor(T.woodDark);
+        if (tg.setBackgroundColor) tg.setBackgroundColor(T.woodDark);
+      } catch {
+        /* older Telegram client without these methods — ignore */
+      }
+    }
+  }, [loaded, themeName]);
+
+  // adds a custom category to whichever list (income/expense) is active
+  const addCategory = (name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const entry = { id: `custom-${Date.now()}`, label: trimmed, icon: "🏷️" };
+    if (type === "income") setIncomeCats((c) => [...c, entry]);
+    else setExpenseCats((c) => [...c, entry]);
+  };
+
+  const pressKey = (k) => {
+    setPressed(k);
+    setTimeout(() => setPressed(null), 90);
+    if (k === "back") {
+      setAmount((a) => a.slice(0, -1));
+      return;
+    }
+    if (k === ".") {
+      if (!amount.includes(".")) setAmount((a) => (a === "" ? "0." : a + "."));
+      return;
+    }
+    setAmount((a) => (a.length > 8 ? a : a + k));
+  };
+
+  const canProceed = parseFloat(amount) > 0;
+
+  const goToCategory = () => {
+    if (!canProceed) return;
+    setStep("category");
+  };
+
+  const pickCategory = (categoryId) => {
+    setPendingCategory(categoryId);
+    setStep("method");
+  };
+
+  const addCard = (name) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setCards((c) => [...c, { id: `card-${Date.now()}`, name: trimmed, icon: "💳" }]);
+  };
+
+  const removeCard = (id) => {
+    setCards((c) => c.filter((card) => card.id !== id));
+  };
+
+  const pickMethod = (methodId) => {
+    const tx = {
+      id: `${Date.now()}`,
+      amount: parseFloat(amount),
+      currency,
+      type,
+      category: pendingCategory,
+      method: methodId,
+      date: Date.now(),
+    };
+    setTransactions((t) => [tx, ...t]);
+    setToast(`${type === "income" ? "+" : "−"}${formatMoney(tx.amount, tx.currency)} записано!`);
+    setTimeout(() => setToast(null), 1400);
+    setAmount("");
+    setPendingCategory(null);
+    setStep("amount");
+  };
+
+  if (!loaded) {
+    return (
+      <div
+        style={{
+          minHeight: "100dvh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "repeating-linear-gradient(45deg, #4a3626, #4a3626 12px, #43301f 12px, #43301f 24px)",
+        }}
+      >
+        <style>{FONT_CSS}</style>
+        <div className="pf-display" style={{ color: "#F2C14E", fontSize: 12, textAlign: "center" }}>
+          Загрузка...
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      style={{
+        minHeight: "100dvh",
+        background:
+          "repeating-linear-gradient(45deg, #4a3626, #4a3626 12px, #43301f 12px, #43301f 24px)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right)) max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left))",
+        fontSize: 16,
+        overscrollBehavior: "none",
+      }}
+    >
+      <style>{FONT_CSS}</style>
+      <div
+        style={{
+          width: "100%",
+          maxWidth: 380,
+          ...pixelPanel(T, T.woodDark, T.woodDarker, 6),
+          padding: 10,
+        }}
+      >
+        {/* screen "glass" */}
+        <div style={{ ...pixelPanel(T, T.parchment, T.woodDark, 3), overflow: "hidden" }}>
+          {/* Tab sign */}
+          <div style={{ display: "flex", background: T.wood, borderBottom: `3px solid ${T.woodDark}` }}>
+            {[
+              { id: "calc", label: "Кошелёк" },
+              { id: "chart", label: "Сводка" },
+            ].map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setScreen(t.id)}
+                className="pf-display"
+                style={{
+                  flex: 1,
+                  padding: "12px 4px",
+                  fontSize: 10,
+                  letterSpacing: 1,
+                  color: screen === t.id ? T.ink : "#E9D8B0",
+                  background: screen === t.id ? T.gold : "transparent",
+                  border: "none",
+                  borderBottom: screen === t.id ? `4px solid ${T.woodDark}` : "4px solid transparent",
+                  cursor: "pointer",
+                }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          {/* design toggle — switch the whole app's look */}
+          <div style={{ display: "flex", gap: 4, padding: "8px 8px 0" }}>
+            {[
+              { id: "pixel", label: "🟫 Пиксель-ферма" },
+              { id: "retro", label: "🖥️ Касса 90-х" },
+            ].map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setThemeName(t.id)}
+                className="pf-body"
+                style={{
+                  ...pixelButton(T, themeName === t.id ? T.sky : T.parchmentDark),
+                  flex: 1,
+                  padding: "5px 0",
+                  fontSize: 13,
+                  color: T.ink,
+                }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ padding: 14, position: "relative", minHeight: 520 }}>
+            {toast && (
+              <div
+                className="pf-display"
+                style={{
+                  position: "absolute",
+                  top: 8,
+                  left: "50%",
+                  transform: "translateX(-50%)",
+                  ...pixelPanel(T, T.gold, T.woodDark, 2),
+                  padding: "6px 10px",
+                  fontSize: 9,
+                  zIndex: 10,
+                  color: T.ink,
+                  whiteSpace: "nowrap",
+                  animation: "bounceIn 220ms ease-out",
+                }}
+              >
+                🪙 {toast}
+              </div>
+            )}
+
+            {/* Global currency selector — only shown on the stats screen now;
+                on the input screen currency is chosen inline with the amount */}
+            {screen === "chart" && (
+              <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
+                {CURRENCIES.map((c) => (
+                  <button
+                    key={c.id}
+                    onClick={() => setCurrency(c.id)}
+                    className="pf-body"
+                    title={c.label}
+                    style={{
+                      ...pixelButton(T, currency === c.id ? T.sky : T.parchmentDark),
+                      flex: 1,
+                      padding: "5px 0",
+                      fontSize: 14,
+                      color: T.ink,
+                    }}
+                  >
+                    {c.symbol}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {screen === "calc" ? (
+              <CalcScreen
+                T={T}
+                step={step}
+                setStep={setStep}
+                amount={amount}
+                type={type}
+                setType={setType}
+                cats={cats}
+                incomeCats={incomeCats}
+                expenseCats={expenseCats}
+                addCategory={addCategory}
+                pressKey={pressKey}
+                pressed={pressed}
+                goToCategory={goToCategory}
+                canProceed={canProceed}
+                pickCategory={pickCategory}
+                pendingCategory={pendingCategory}
+                pickMethod={pickMethod}
+                currency={currency}
+                setCurrency={setCurrency}
+                cards={cards}
+                addCard={addCard}
+                removeCard={removeCard}
+                recent={transactions.slice(0, 3)}
+              />
+            ) : (
+              <ChartScreen
+                T={T}
+                transactions={transactions}
+                displayCurrency={currency}
+                cards={cards}
+                incomeCats={incomeCats}
+                expenseCats={expenseCats}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+      <style>{`
+        @keyframes bounceIn {
+          0% { opacity: 0; transform: translateX(-50%) translateY(-6px) scale(0.9); }
+          60% { opacity: 1; transform: translateX(-50%) translateY(2px) scale(1.03); }
+          100% { transform: translateX(-50%) translateY(0) scale(1); }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+// ================= Calculator Screen =================
+function CalcScreen({ T, step, setStep, amount, type, setType, cats, incomeCats, expenseCats, addCategory, pressKey, pressed, goToCategory, canProceed, pickCategory, pendingCategory, pickMethod, currency, setCurrency, cards, addCard, removeCard, recent }) {
+  const [newCardName, setNewCardName] = useState("");
+  const [addingCard, setAddingCard] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState("");
+  const [addingCategory, setAddingCategory] = useState(false);
+
+  let stepBody;
+
+  if (step === "method") {
+    const methods = [CASH_ACCOUNT, ...cards];
+    stepBody = (
+      <div>
+        {/* summary strip — LCD/VFD window */}
+        <div
+          style={{
+            ...pixelPanel(T, T.screenBg, T.woodDark, 3),
+            padding: "10px 12px",
+            marginBottom: 10,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <button
+            onClick={() => setStep("category")}
+            className="pf-display"
+            style={{ ...pixelButton(T, T.parchmentDark), padding: "6px 8px", fontSize: 10, color: T.ink }}
+          >
+            ←
+          </button>
+          <div style={{ textAlign: "right" }}>
+            <div className="pf-display" style={{ color: type === "income" ? T.grass : T.rust, fontSize: 16, textShadow: T.screenGlow ? "0 0 6px currentColor" : "none" }}>
+              {formatMoney(parseFloat(amount || "0"), currency)}
+            </div>
+            <div className="pf-body" style={{ fontSize: 13, color: "#C9D8B0" }}>
+              {catInfo(pendingCategory, incomeCats, expenseCats).icon} {catInfo(pendingCategory, incomeCats, expenseCats).label}
+            </div>
+          </div>
+        </div>
+
+        <div className="pf-body" style={{ fontSize: 14, color: T.wood, marginBottom: 4 }}>
+          Чем платили?
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 10 }}>
+          {methods.map((m) => (
+            <div key={m.id} style={{ display: "flex", gap: 6 }}>
+              <button
+                onClick={() => pickMethod(m.id)}
+                className="pf-body"
+                style={{
+                  ...pixelButton(T, T.parchmentDark),
+                  flex: 1,
+                  padding: "10px 10px",
+                  fontSize: 17,
+                  color: T.ink,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  justifyContent: "flex-start",
+                }}
+              >
+                <span style={{ fontSize: 18 }}>{m.icon}</span>
+                <span>{m.name}</span>
+              </button>
+              {m.id !== "cash" && (
+                <button
+                  onClick={() => removeCard(m.id)}
+                  title="Удалить карту"
+                  style={{
+                    ...pixelButton(T, T.rust),
+                    padding: "0 10px",
+                    color: "#fff",
+                    fontSize: 14,
+                  }}
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* add a new card, named however the user likes */}
+        {addingCard ? (
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            <input
+              autoFocus
+              value={newCardName}
+              onChange={(e) => setNewCardName(e.target.value)}
+              placeholder="Название карты"
+              className="pf-body"
+              style={{
+                flex: 1,
+                fontSize: 17,
+                padding: "8px 10px",
+                border: `3px solid ${T.woodDark}`,
+                background: "#fff",
+                color: T.ink,
+                borderRadius: T.mode === "retro" ? 6 : 0,
+              }}
+            />
+            <button
+              onClick={() => {
+                addCard(newCardName);
+                setNewCardName("");
+                setAddingCard(false);
+              }}
+              disabled={!newCardName.trim()}
+              className="pf-display"
+              style={{ ...pixelButton(T, newCardName.trim() ? T.gold : "#C9B98A"), padding: "0 12px", fontSize: 10, color: T.ink }}
+            >
+              ✓
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setAddingCard(true)}
+            className="pf-body"
+            style={{
+              ...pixelButton(T, T.parchmentDark),
+              width: "100%",
+              padding: "8px 0",
+              fontSize: 16,
+              color: T.ink,
+            }}
+          >
+            ＋ Добавить карту
+          </button>
+        )}
+      </div>
+    );
+  } else if (step === "category") {
+    stepBody = (
+      <div>
+        {/* summary strip — LCD/VFD window */}
+        <div
+          style={{
+            ...pixelPanel(T, T.screenBg, T.woodDark, 3),
+            padding: "10px 12px",
+            marginBottom: 12,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <button
+            onClick={() => setStep("amount")}
+            className="pf-display"
+            style={{ ...pixelButton(T, T.parchmentDark), padding: "6px 8px", fontSize: 10, color: T.ink }}
+          >
+            ←
+          </button>
+          <div className="pf-display" style={{ color: type === "income" ? T.grass : T.rust, fontSize: 16, textShadow: T.screenGlow ? "0 0 6px currentColor" : "none" }}>
+            {formatMoney(parseFloat(amount || "0"), currency)}
+          </div>
+        </div>
+
+        <div className="pf-body" style={{ fontSize: 14, color: T.wood, marginBottom: 4 }}>
+          Выберите категорию
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6, marginBottom: 12 }}>
+          {cats.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => pickCategory(c.id)}
+              style={{
+                ...pixelButton(T, T.parchmentDark, false),
+                padding: "6px 2px",
+                minHeight: 58,
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 2,
+              }}
+            >
+              <span style={{ fontSize: 16 }}>{c.icon}</span>
+              <span className="pf-body" style={{ fontSize: 11, color: T.ink, lineHeight: 1.05, textAlign: "center" }}>{c.label}</span>
+            </button>
+          ))}
+          <button
+            onClick={() => setAddingCategory(true)}
+            style={{
+              ...pixelButton(T, T.gold, false),
+              padding: "6px 2px",
+              minHeight: 58,
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 2,
+            }}
+          >
+            <span style={{ fontSize: 16 }}>＋</span>
+            <span className="pf-body" style={{ fontSize: 11, color: T.ink, lineHeight: 1.05, textAlign: "center" }}>Своя</span>
+          </button>
+        </div>
+
+        {/* add a custom category, named however the user likes */}
+        {addingCategory && (
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            <input
+              autoFocus
+              value={newCategoryName}
+              onChange={(e) => setNewCategoryName(e.target.value)}
+              placeholder="Название категории"
+              className="pf-body"
+              style={{
+                flex: 1,
+                fontSize: 17,
+                padding: "8px 10px",
+                border: `3px solid ${T.woodDark}`,
+                background: "#fff",
+                color: T.ink,
+                borderRadius: T.mode === "retro" ? 6 : 0,
+              }}
+            />
+            <button
+              onClick={() => {
+                addCategory(newCategoryName);
+                setNewCategoryName("");
+                setAddingCategory(false);
+              }}
+              disabled={!newCategoryName.trim()}
+              className="pf-display"
+              style={{ ...pixelButton(T, newCategoryName.trim() ? T.gold : "#C9B98A"), padding: "0 12px", fontSize: 10, color: T.ink }}
+            >
+              ✓
+            </button>
+            <button
+              onClick={() => {
+                setNewCategoryName("");
+                setAddingCategory(false);
+              }}
+              className="pf-display"
+              style={{ ...pixelButton(T, T.parchmentDark), padding: "0 12px", fontSize: 10, color: T.ink }}
+            >
+              ✕
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  } else {
+    stepBody = (
+      <div>
+        {/* Amount display — LCD/VFD window */}
+        <div
+          style={{
+            ...pixelPanel(T, T.screenBg, T.woodDark, 3),
+            padding: "16px 12px",
+            textAlign: "right",
+            marginBottom: 8,
+          }}
+        >
+          <div className="pf-display" style={{ color: type === "income" ? T.grass : T.rust, fontSize: 26, lineHeight: 1.2, wordBreak: "break-all", textShadow: T.screenGlow ? "0 0 6px currentColor" : "none" }}>
+            {amount === "" ? "0" : amount}
+            <span style={{ opacity: 0.6 }}> {CUR_META[currency].symbol}</span>
+          </div>
+          {parseFloat(amount) > 0 && (
+            <div className="pf-body" style={{ fontSize: 13, color: "#9FB08A", marginTop: 2 }}>
+              {CURRENCIES.filter((c) => c.id !== currency)
+                .map((c) => formatMoney(convertToday(parseFloat(amount), currency, c.id), c.id))
+                .join(" · ")}
+            </div>
+          )}
+        </div>
+
+        {/* Currency of this entry */}
+        <div style={{ display: "flex", gap: 4, marginBottom: 12 }}>
+          {CURRENCIES.map((c) => (
+            <button
+              key={c.id}
+              onClick={() => setCurrency(c.id)}
+              className="pf-body"
+              title={c.label}
+              style={{
+                ...pixelButton(T, currency === c.id ? T.gold : T.parchmentDark),
+                flex: 1,
+                padding: "4px 0",
+                fontSize: 13,
+                color: T.ink,
+              }}
+            >
+              {c.symbol}
+            </button>
+          ))}
+        </div>
+
+        {/* Income / Expense toggle */}
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <button
+            onClick={() => setType("income")}
+            className="pf-body"
+            style={{
+              ...pixelButton(T, type === "income" ? T.grass : T.parchmentDark),
+              flex: 1,
+              padding: "8px 4px",
+              fontSize: 20,
+              color: T.ink,
+            }}
+          >
+            🧺 Доход
+          </button>
+          <button
+            onClick={() => setType("expense")}
+            className="pf-body"
+            style={{
+              ...pixelButton(T, type === "expense" ? T.rust : T.parchmentDark),
+              flex: 1,
+              padding: "8px 4px",
+              fontSize: 20,
+              color: type === "expense" ? "#fff" : T.ink,
+            }}
+          >
+            🕳️ Расход
+          </button>
+        </div>
+
+        {/* Keypad */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginBottom: 12 }}>
+          {["1", "2", "3", "4", "5", "6", "7", "8", "9", ".", "0", "back"].map((k) => (
+            <button
+              key={k}
+              onClick={() => pressKey(k)}
+              className="pf-display"
+              style={{
+                ...pixelButton(T, T.mode === "retro" && k !== "back" ? T.gold : T.parchmentDark, pressed === k),
+                padding: "10px 0",
+                fontSize: k === "back" ? 12 : 13,
+                color: T.ink,
+              }}
+            >
+              {k === "back" ? "⌫" : k}
+            </button>
+          ))}
+        </div>
+
+        {/* Next */}
+        <button
+          onClick={goToCategory}
+          disabled={!canProceed}
+          className="pf-display"
+          style={{
+            ...pixelButton(T, canProceed ? T.sky : "#C9B98A"),
+            width: "100%",
+            padding: "12px 0",
+            fontSize: 12,
+            color: T.mode === "retro" ? "#fff" : T.ink,
+            opacity: canProceed ? 1 : 0.6,
+            cursor: canProceed ? "pointer" : "not-allowed",
+          }}
+        >
+          Далее → категория
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {/* ---- register cabinet ---- */}
+      <div style={{ ...pixelPanel(T, T.mode === "retro" ? T.parchmentDeep : T.wood, T.woodDark, T.mode === "retro" ? 3 : 4), padding: 8, marginBottom: 14 }}>
+        {T.mode === "retro" ? (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8, padding: "0 2px" }}>
+            <div style={{ width: 34, height: 9, background: T.woodDark, borderRadius: 3 }} title="лоток для чека" />
+            <span className="pf-body" style={{ fontSize: 12, color: T.wood, letterSpacing: 1 }}>КАССА-90</span>
+            <div style={{ width: 9, height: 9, borderRadius: "50%", background: T.rust }} title="индикатор" />
+          </div>
+        ) : (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              background: T.brassDark,
+              border: `2px solid ${T.woodDark}`,
+              padding: "3px 8px",
+              marginBottom: 8,
+            }}
+          >
+            <span style={{ fontSize: 7, color: "#FFF3C4" }}>●</span>
+            <span className="pf-display" style={{ fontSize: 8, color: "#FFF3D0", letterSpacing: 1 }}>КАССА</span>
+            <span style={{ fontSize: 7, color: "#FFF3C4" }}>●</span>
+          </div>
+        )}
+
+        <div style={{ ...pixelPanel(T, T.parchment, T.woodDark, 2), padding: 10 }}>
+          {stepBody}
+        </div>
+      </div>
+
+      {/* recent entries — sits below the register like a receipt */}
+      {step === "amount" && (
+        <div>
+          <div className="pf-body" style={{ fontSize: 13, color: T.wood, marginBottom: 4 }}>Последние записи</div>
+          {recent.length === 0 && (
+            <div
+              className="pf-body"
+              style={{
+                textAlign: "center",
+                padding: "14px 8px",
+                background: T.parchmentDark,
+                border: `2px dashed ${T.woodDark}`,
+                color: T.wood,
+                fontSize: 15,
+              }}
+            >
+              🌱 Записей пока нет — введите первую сумму
+            </div>
+          )}
+          {recent.map((r) => {
+            const info = catInfo(r.category, incomeCats, expenseCats);
+            const method = accountInfo(r.method, cards);
+            const converted = convertAmount(r, currency);
+            return (
+              <div
+                key={r.id}
+                className="pf-body"
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  padding: "4px 6px",
+                  background: T.parchmentDark,
+                  border: `2px solid ${T.woodDark}`,
+                  marginBottom: 4,
+                  fontSize: 15,
+                }}
+              >
+                <span>
+                  {info.icon} {info.label}
+                  <span style={{ display: "block", fontSize: 11, color: T.wood, opacity: 0.85 }}>
+                    {method.icon} {method.name}
+                  </span>
+                </span>
+                <span style={{ textAlign: "right" }}>
+                  <span style={{ color: r.type === "income" ? T.grassDark : T.rustDark, fontWeight: "bold" }}>
+                    {r.type === "income" ? "+" : "−"}{formatMoney(converted, currency)}
+                  </span>
+                  {r.currency !== currency && (
+                    <span style={{ display: "block", fontSize: 11, color: T.wood, opacity: 0.8 }}>
+                      ({formatMoney(r.amount, r.currency)} в день записи)
+                    </span>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ================= Chart Screen =================
+function ChartScreen({ T, transactions, displayCurrency, cards, incomeCats, expenseCats }) {
+  const [period, setPeriod] = useState("week"); // week | month
+  const [tab, setTab] = useState("expense"); // expense | income
+  const [showCategories, setShowCategories] = useState(false);
+  const [showMethods, setShowMethods] = useState(false);
+  const [showDynamics, setShowDynamics] = useState(false);
+  const [viewMode, setViewMode] = useState("bars"); // bars | pie
+
+  const dayCount = period === "week" ? 7 : 30;
+  const now = Date.now();
+  const todayStart = startOfDay(now);
+
+  // real calendar days, oldest -> today, tied to the device's actual date
+  const dayList = useMemo(
+    () => Array.from({ length: dayCount }, (_, i) => todayStart - (dayCount - 1 - i) * DAY_MS),
+    [dayCount, todayStart]
+  );
+  const rangeStart = dayList[0];
+  const rangeEnd = dayList[dayList.length - 1];
+  const rangeLabel =
+    period === "week"
+      ? `${fmtDay(rangeStart)} – ${fmtDay(rangeEnd)}`
+      : new Date(rangeEnd).toLocaleDateString("ru-RU", { month: "long", year: "numeric" });
+
+  const filtered = useMemo(
+    () => transactions.filter((t) => t.date >= rangeStart),
+    [transactions, rangeStart]
+  );
+  // amount of each transaction recalculated into the display currency,
+  // using the exchange rate of the day the entry was made
+  const amt = (t) => convertAmount(t, displayCurrency);
+
+  const totalIncome = filtered.filter((t) => t.type === "income").reduce((s, t) => s + amt(t), 0);
+  const totalExpense = filtered.filter((t) => t.type === "expense").reduce((s, t) => s + amt(t), 0);
+  const balance = totalIncome - totalExpense;
+
+  // per-day net totals, bucketed by real calendar day
+  const dayTotals = dayList.map((dayStart) => {
+    const dayEnd = dayStart + DAY_MS;
+    const dayTx = filtered.filter((t) => t.date >= dayStart && t.date < dayEnd);
+    const inc = dayTx.filter((t) => t.type === "income").reduce((s, t) => s + amt(t), 0);
+    const exp = dayTx.filter((t) => t.type === "expense").reduce((s, t) => s + amt(t), 0);
+    return { date: dayStart, net: inc - exp };
+  });
+  const maxAbs = Math.max(1, ...dayTotals.map((d) => Math.abs(d.net)));
+  // show a date label under every bar for the week view, and every 5th bar for the month view
+  const labelEvery = period === "week" ? 1 : 5;
+
+  // category breakdown for active tab
+  const catList = tab === "income" ? incomeCats : expenseCats;
+  const catTotals = catList.map((c) => ({
+    ...c,
+    total: filtered.filter((t) => t.type === tab && t.category === c.id).reduce((s, t) => s + amt(t), 0),
+  }));
+  const catMax = Math.max(1, ...catTotals.map((c) => c.total));
+  const catSum = catTotals.reduce((s, c) => s + c.total, 0) || 1;
+
+  // breakdown by payment method (cash + each named card) for the active tab
+  const methodList = [CASH_ACCOUNT, ...cards];
+  const methodTotals = methodList.map((m) => ({
+    ...m,
+    total: filtered.filter((t) => t.type === tab && t.method === m.id).reduce((s, t) => s + amt(t), 0),
+  }));
+  const methodMax = Math.max(1, ...methodTotals.map((m) => m.total));
+  const methodSum = methodTotals.reduce((s, m) => s + m.total, 0) || 1;
+
+  return (
+    <div>
+      {/* period selector */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+        {[
+          { id: "week", label: "Неделя" },
+          { id: "month", label: "Месяц" },
+        ].map((p) => (
+          <button
+            key={p.id}
+            onClick={() => setPeriod(p.id)}
+            className="pf-body"
+            style={{
+              ...pixelButton(T, period === p.id ? T.sky : T.parchmentDark),
+              flex: 1,
+              padding: "6px 0",
+              fontSize: 15,
+              color: T.ink,
+            }}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+      <div className="pf-body" style={{ textAlign: "center", fontSize: 14, color: T.wood, marginBottom: 10 }}>
+        {rangeLabel}
+      </div>
+
+      {/* balance summary */}
+      <div style={{ ...pixelPanel(T, T.woodDarker, T.woodDark, 3), padding: 12, marginBottom: 12, textAlign: "center" }}>
+        <div className="pf-body" style={{ color: "#E9D8B0", fontSize: 14 }}>Баланс за период</div>
+        <div className="pf-display" style={{ color: balance >= 0 ? T.grass : T.rust, fontSize: 20, margin: "6px 0" }}>
+          {balance >= 0 ? "+" : "−"}{formatMoney(Math.abs(balance), displayCurrency)}
+        </div>
+        <div className="pf-body" style={{ color: "#C9B98A", fontSize: 13, marginBottom: 6 }}>
+          {CURRENCIES.filter((c) => c.id !== displayCurrency)
+            .map((c) => formatMoney(Math.abs(convertToday(balance, displayCurrency, c.id)), c.id))
+            .join(" · ")}
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-around", marginTop: 6 }}>
+          <span className="pf-body" style={{ color: T.grass, fontSize: 15 }}>🧺 +{formatMoney(totalIncome, displayCurrency)}</span>
+          <span className="pf-body" style={{ color: T.rust, fontSize: 15 }}>🕳️ −{formatMoney(totalExpense, displayCurrency)}</span>
+        </div>
+      </div>
+
+      {/* shared type tab + view-mode toggle, shown whenever either breakdown panel is open */}
+      {(showCategories || showMethods) && (
+        <div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+            {[
+              { id: "expense", label: "Расходы" },
+              { id: "income", label: "Доходы" },
+            ].map((t) => (
+              <button
+                key={t.id}
+                onClick={() => setTab(t.id)}
+                className="pf-body"
+                style={{
+                  ...pixelButton(T, tab === t.id ? T.gold : T.parchmentDark),
+                  flex: 1,
+                  padding: "6px 0",
+                  fontSize: 15,
+                  color: T.ink,
+                }}
+              >
+                {t.label}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+            {[
+              { id: "bars", label: "▦ Бары" },
+              { id: "pie", label: "◕ Диаграмма" },
+            ].map((v) => (
+              <button
+                key={v.id}
+                onClick={() => setViewMode(v.id)}
+                className="pf-body"
+                style={{
+                  ...pixelButton(T, viewMode === v.id ? T.sky : T.parchmentDark),
+                  flex: 1,
+                  padding: "5px 0",
+                  fontSize: 14,
+                  color: T.ink,
+                }}
+              >
+                {v.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* collapsible category breakdown */}
+      <button
+        onClick={() => setShowCategories((v) => !v)}
+        className="pf-body"
+        style={{
+          ...pixelButton(T, T.parchmentDark),
+          width: "100%",
+          padding: "8px 0",
+          fontSize: 16,
+          color: T.ink,
+          marginBottom: showCategories ? 8 : 6,
+        }}
+      >
+        {showCategories ? "▲ Скрыть разбивку по категориям" : "▼ Показать разбивку по категориям"}
+      </button>
+
+      {showCategories && (
+        <div style={{ marginBottom: 6 }}>
+          {viewMode === "pie" ? (
+            <PieBreakdown
+              T={T}
+              items={catTotals.map((c) => ({ id: c.id, label: c.label, icon: c.icon, total: c.total }))}
+              sum={catSum}
+            />
+          ) : (
+            catTotals
+              .sort((a, b) => b.total - a.total)
+              .map((c) => (
+                <div key={c.id} style={{ marginBottom: 8 }}>
+                  <div className="pf-body" style={{ display: "flex", justifyContent: "space-between", fontSize: 15, color: T.ink }}>
+                    <span>{c.icon} {c.label}</span>
+                    <span>{formatMoney(c.total, displayCurrency)} · {Math.round((c.total / catSum) * 100)}%</span>
+                  </div>
+                  <div style={{ background: T.parchmentDeep, border: `2px solid ${T.woodDark}`, height: 12 }}>
+                    <div
+                      style={{
+                        width: `${(c.total / catMax) * 100}%`,
+                        height: "100%",
+                        background: tab === "income" ? T.grass : T.rust,
+                      }}
+                    />
+                  </div>
+                </div>
+              ))
+          )}
+        </div>
+      )}
+
+      {/* collapsible payment-method (cash / cards) breakdown */}
+      <button
+        onClick={() => setShowMethods((v) => !v)}
+        className="pf-body"
+        style={{
+          ...pixelButton(T, T.parchmentDark),
+          width: "100%",
+          padding: "8px 0",
+          fontSize: 16,
+          color: T.ink,
+          marginBottom: showMethods ? 8 : 0,
+        }}
+      >
+        {showMethods ? "▲ Скрыть разбивку по способу оплаты" : "▼ Показать разбивку по способу оплаты"}
+      </button>
+
+      {showMethods && (
+        <div>
+          {viewMode === "pie" ? (
+            <PieBreakdown
+              T={T}
+              items={methodTotals.map((m) => ({ id: m.id, label: m.name, icon: m.icon, total: m.total }))}
+              sum={methodSum}
+            />
+          ) : (
+            methodTotals
+              .sort((a, b) => b.total - a.total)
+              .map((m) => (
+                <div key={m.id} style={{ marginBottom: 8 }}>
+                  <div className="pf-body" style={{ display: "flex", justifyContent: "space-between", fontSize: 15, color: T.ink }}>
+                    <span>{m.icon} {m.name}</span>
+                    <span>{formatMoney(m.total, displayCurrency)} · {Math.round((m.total / methodSum) * 100)}%</span>
+                  </div>
+                  <div style={{ background: T.parchmentDeep, border: `2px solid ${T.woodDark}`, height: 12 }}>
+                    <div
+                      style={{
+                        width: `${(m.total / methodMax) * 100}%`,
+                        height: "100%",
+                        background: tab === "income" ? T.sky : T.gold,
+                      }}
+                    />
+                  </div>
+                </div>
+              ))
+          )}
+        </div>
+      )}
+
+      {/* collapsible daily dynamics — tucked at the very bottom, hidden by default */}
+      <button
+        onClick={() => setShowDynamics((v) => !v)}
+        className="pf-body"
+        style={{
+          ...pixelButton(T, T.parchmentDark),
+          width: "100%",
+          padding: "8px 0",
+          fontSize: 16,
+          color: T.ink,
+          marginTop: 10,
+          marginBottom: showDynamics ? 6 : 0,
+        }}
+      >
+        {showDynamics ? "▲ Скрыть динамику по дням" : "▼ Показать динамику по дням"}
+      </button>
+
+      {showDynamics && (
+        <div>
+          <div className="pf-body" style={{ fontSize: 14, color: T.wood, marginBottom: 4, textAlign: "center" }}>
+            Динамика по дням · {rangeLabel}
+          </div>
+          <div
+            style={{
+              ...pixelPanel(T, T.parchmentDark, T.woodDark, 2),
+              padding: "12px 6px 8px",
+              overflowX: period === "month" ? "auto" : "visible",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "flex-end", justifyContent: period === "week" ? "space-between" : "flex-start", gap: period === "week" ? 0 : 4, height: 90, minWidth: period === "month" ? dayCount * 12 : "auto" }}>
+              {dayTotals.map((d, i) => {
+                const h = Math.max(4, (Math.abs(d.net) / maxAbs) * 60);
+                const positive = d.net >= 0;
+                const isToday = d.date === todayStart;
+                return (
+                  <div key={d.date} style={{ display: "flex", flexDirection: "column", alignItems: "center", width: period === "week" ? 20 : 10 }}>
+                    {positive && d.net > 0 && <div style={{ fontSize: 11, marginBottom: -2 }}>🌿</div>}
+                    <div
+                      title={`${fmtDay(d.date)}: ${d.net >= 0 ? "+" : "−"}${formatMoney(Math.abs(d.net), displayCurrency)}`}
+                      style={{
+                        width: period === "week" ? 12 : 7,
+                        height: h,
+                        background: positive ? T.grassDark : T.rustDark,
+                        border: `2px solid ${isToday ? T.gold : T.woodDark}`,
+                      }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ display: "flex", justifyContent: period === "week" ? "space-between" : "flex-start", gap: period === "week" ? 0 : 4, minWidth: period === "month" ? dayCount * 12 : "auto", marginTop: 4 }}>
+              {dayTotals.map((d, i) => (
+                <div
+                  key={d.date}
+                  className="pf-body"
+                  style={{
+                    width: period === "week" ? 20 : 10,
+                    fontSize: 10,
+                    textAlign: "center",
+                    color: d.date === todayStart ? T.rustDark : T.wood,
+                    visibility: i % labelEvery === 0 || i === dayTotals.length - 1 ? "visible" : "hidden",
+                  }}
+                >
+                  {period === "week" ? fmtWeekday(d.date) : new Date(d.date).getDate()}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Small pixel-framed pie chart (built with a CSS conic-gradient) plus a
+// swatch legend — the alternate view for a category/method breakdown.
+function PieBreakdown({ T, items, sum }) {
+  const sorted = items.filter((i) => i.total > 0).sort((a, b) => b.total - a.total);
+  let acc = 0;
+  const stops = sorted.map((it, idx) => {
+    const pct = (it.total / sum) * 100;
+    const start = acc;
+    acc += pct;
+    return `${PIE_PALETTE[idx % PIE_PALETTE.length]} ${start}% ${acc}%`;
+  });
+  const gradient = stops.length ? `conic-gradient(${stops.join(", ")})` : T.parchmentDeep;
+
+  return (
+    <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+      <div
+        style={{
+          width: 96,
+          height: 96,
+          minWidth: 96,
+          borderRadius: "50%",
+          background: gradient,
+          border: `3px solid ${T.woodDark}`,
+          boxShadow: "inset 2px 2px 0 rgba(255,255,255,0.25), inset -2px -2px 0 rgba(0,0,0,0.3)",
+        }}
+      />
+      <div style={{ flex: 1, minWidth: 0 }}>
+        {sorted.length === 0 && (
+          <div className="pf-body" style={{ fontSize: 14, color: T.wood }}>Нет данных за период</div>
+        )}
+        {sorted.map((it, idx) => (
+          <div key={it.id} className="pf-body" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, color: T.ink, marginBottom: 3 }}>
+            <span style={{ width: 10, height: 10, minWidth: 10, background: PIE_PALETTE[idx % PIE_PALETTE.length], border: `1px solid ${T.woodDark}` }} />
+            <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{it.icon} {it.label}</span>
+            <span>{Math.round((it.total / sum) * 100)}%</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
